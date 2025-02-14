@@ -129,24 +129,20 @@ export class DebouncerManager<TArgs extends any[], TResult> {
             this.lastReject = null;
           }
         }
-        return new Promise((resolve, reject) => {
-          // Store the new promise and its reject so it can be cancelled if needed.
-          this.lastPromise = new Promise<TResult>((innerResolve, innerReject) => {
-            this.lastReject = innerReject;
-            this.timer = setTimeout(async () => {
-              this.timer = null;
-              this.lastArgs = null;
-              try {
-                const result = await this.fn(...args);
-                innerResolve(result);
-                resolve(result);
-              } catch (error) {
-                innerReject(error);
-                reject(error);
-              }
-            }, this.delay);
-          });
+        this.lastPromise = new Promise<TResult>((resolve, reject) => {
+          this.lastReject = reject;
+          this.timer = setTimeout(async () => {
+            this.timer = null;
+            this.lastArgs = null;
+            try {
+              const result = await this.fn(...args);
+              resolve(result);
+            } catch (error) {
+              reject(error);
+            }
+          }, this.delay);
         });
+        return this.lastPromise;
       }
     }
   

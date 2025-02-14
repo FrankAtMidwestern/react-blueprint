@@ -60,7 +60,7 @@ export class UnifiedManager {
       onTaskFailure: options?.concurrencyOptions?.onTaskFailure,
       maxPendingTasks: options?.concurrencyOptions?.maxPendingTasks,
       maxCompletedTasks: options?.concurrencyOptions?.maxCompletedTasks,
-    });
+    }, this.abortManager);
     // Create a CongestionManager instance with provided or default options.
     this.congestionManager = new CongestionManager({
       initialDelay: options?.congestionOptions?.initialDelay ?? 500,
@@ -73,6 +73,7 @@ export class UnifiedManager {
     // Save default debounce options.
     if (options?.debounceOptions) {
       this.defaultDebounceOptions = options.debounceOptions;
+
     }
   }
 
