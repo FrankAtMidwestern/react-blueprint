@@ -15,6 +15,31 @@ export enum TaskStatus {
 }
 
 /**
+ * Metadata stored for each completed task.
+ * Note that we're storing minimal fields to reduce memory usage.
+ */
+interface CompletedTaskMetadata {
+  id: string;
+  priority?: number;
+  addedAt?: Date;
+  status?: TaskStatus;
+  attempts?: number;
+}
+
+/**
+ * The record we store for each completed task.
+ * - `taskMetadata`: minimal identifying info about the task
+ * - `result` or `error`: indicates how the task ended
+ * - `completedAt`: timestamp of completion
+ */
+interface CompletedTaskRecord<T> {
+  taskMetadata: CompletedTaskMetadata;
+  result?: T;
+  error?: string;
+  completedAt: Date;
+}
+
+/**
  * Interface for each queue task.
  */
 export interface QueueTask<T> {
@@ -54,15 +79,6 @@ export interface QueueTask<T> {
    * (Do not set manually; used by the queue.)
    */
   _reject?: (error: any) => void;
-}
-
-/**
- * Internal interface for storing completed task data.
- */
-interface CompletedTaskRecord<T> {
-  task: QueueTask<T>;
-  result?: T;
-  error?: string;
 }
 
 /**
@@ -114,9 +130,18 @@ export interface ConcurrencyQueueOptions {
   maxPendingTasks?: number;
   /**
    * Optional maximum number of completed tasks stored in memory.
-   * Older completed tasks will be automatically removed.
+   * Setting this to 0 disables storing completed tasks altogether.
    */
   maxCompletedTasks?: number;
+  /**
+   * Optional maximum age (in ms) for completed tasks.
+   * Tasks older than this are removed.  Example: 5 * 60 * 1000 for 5 minutes.
+   */
+  maxCompletedTaskAge?: number;
+  /**
+   * Debounce delay (in ms) for state updates.
+   */
+  stateUpdateDebounceDelay?: number;
 }
 
 /**
@@ -136,6 +161,8 @@ export interface ConcurrencyQueueOptions {
  *   stateUpdateCallback: (state) => console.log(state),
  *   maxPendingTasks: 100,
  *   maxCompletedTasks: 1000,
+ *   maxCompletedTaskAge: 300000, // 5 minutes
+ *   stateUpdateDebounceDelay: 100,
  * });
  *
  * queue.addTask({
@@ -162,6 +189,8 @@ export class ConcurrencyQueue<T> {
   private onTaskFailure?: (task: QueueTask<T>, error: any) => void;
   private maxPendingTasks?: number;
   private maxCompletedTasks: number;
+  private maxCompletedTaskAge?: number;
+  private stateUpdateDebounceDelay: number;
 
   // Using a heap-based priority queue for pending tasks.
   private pendingQueue: PriorityQueue<QueueTask<T>>;
@@ -178,12 +207,11 @@ export class ConcurrencyQueue<T> {
   // A flag to indicate the queue is destroyed.
   private destroyed: boolean = false;
 
-  // --- New: Debouncer for state updates ---
+  // Debouncer for state updates
   private debouncedUpdateState?: DebouncerManager<[], void>;
-  // You can adjust the debounce delay as needed (default is 100ms)
-  private stateUpdateDebounceDelay: number = 100;
 
   constructor(options: ConcurrencyQueueOptions, abortManager?: AbortManager) {
+    // Validate concurrency
     if (
       typeof options.concurrency !== "number" ||
       options.concurrency < 1 ||
@@ -201,14 +229,31 @@ export class ConcurrencyQueue<T> {
     this.onTaskSuccess = options.onTaskSuccess;
     this.onTaskFailure = options.onTaskFailure;
     this.maxPendingTasks = options.maxPendingTasks;
-    this.abortManager = abortManager || new AbortManager();
-    this.maxCompletedTasks =
-      options.maxCompletedTasks !== undefined && options.maxCompletedTasks > 0
-        ? options.maxCompletedTasks
-        : 1000;
 
-    // Initialize the pendingQueue as a max-heap.
-    // Higher priority tasks (larger numbers) come out first.
+    // Validate maxCompletedTasks
+    if (
+      options.maxCompletedTasks !== undefined &&
+      (!Number.isInteger(options.maxCompletedTasks) || options.maxCompletedTasks < 0)
+    ) {
+      throw new Error("maxCompletedTasks must be a non-negative integer.");
+    }
+    this.maxCompletedTasks = options.maxCompletedTasks ?? 1000;
+
+    // Validate maxCompletedTaskAge
+    if (options.maxCompletedTaskAge !== undefined) {
+      if (typeof options.maxCompletedTaskAge !== 'number' || options.maxCompletedTaskAge <= 0) {
+        throw new Error("maxCompletedTaskAge must be a positive number.");
+      }
+    }
+    this.maxCompletedTaskAge = options.maxCompletedTaskAge;
+
+    // Debounce delay for state updates
+    this.stateUpdateDebounceDelay = options.stateUpdateDebounceDelay ?? 100;
+
+    // Use an existing AbortManager or create a new one
+    this.abortManager = abortManager || new AbortManager();
+
+    // Initialize the pendingQueue as a max-heap (higher priority = bigger number).
     this.pendingQueue = new PriorityQueue<QueueTask<T>>((a, b) => {
       const priorityA = typeof a.priority === "number" ? a.priority : 0;
       const priorityB = typeof b.priority === "number" ? b.priority : 0;
@@ -240,11 +285,19 @@ export class ConcurrencyQueue<T> {
           }
         },
         this.stateUpdateDebounceDelay,
-        false // trailing edge execution
+        false // trailing
       );
     }
   }
 
+  /**
+   * Adds a new task to the queue.
+   *
+   * Validates the task properties and prevents duplicate task IDs.
+   *
+   * @param task Partial task details (the queue will add addedAt, status, etc.)
+   * @returns A Promise that resolves or rejects with the task result.
+   */
   public addTask(
     task: Omit<
       QueueTask<T>,
@@ -321,12 +374,12 @@ export class ConcurrencyQueue<T> {
       this.processingQueue.size < this.concurrency &&
       this.pendingQueue.size() > 0
     ) {
+      // If offline, skip tasks that are not offlineAllowed
       if (this.isOffline && this.isOffline()) {
-        // Look for a task that is allowed offline.
         const pendingArray = this.pendingQueue.toArray();
-        const taskIndex = pendingArray.findIndex(task => task.offlineAllowed);
+        const taskIndex = pendingArray.findIndex((task) => task.offlineAllowed);
         if (taskIndex === -1) break;
-        // Remove that task using our remove method.
+
         let task: QueueTask<T> | undefined;
         this.pendingQueue.remove((t) => {
           if (t.id === pendingArray[taskIndex].id) {
@@ -348,47 +401,14 @@ export class ConcurrencyQueue<T> {
   }
 
   /**
-   * Enqueues a task into the pending queue.
+   * Runs a single task with timeout, retry, and error handling.
    */
-  private enqueueTask(task: QueueTask<T>) {
-    this.pendingQueue.push(task);
-    this.updateState();
-  }
-
-  public cancelTask(taskId: string) {
-    if (this.destroyed) return;
-
-    // Attempt to remove the task from the pending queue.
-    const removed = this.pendingQueue.remove(task => task.id === taskId);
-    if (removed) {
-      const errorMsg = "Task cancelled";
-      this.addToCompleted(taskId, { task: { id: taskId } as QueueTask<T>, error: errorMsg });
-      this.updateState();
-      return;
-    }
-
-    // Cancel processing tasks.
-    if (this.processingQueue.has(taskId)) {
-      const task = this.processingQueue.get(taskId)!;
-      try {
-        this.abortManager.abortById(taskId);
-      } catch (err) {
-        console.error(`Error aborting task ${taskId}:`, err);
-      }
-      task.status = TaskStatus.Aborted;
-      task._reject && task._reject(new Error("Task aborted"));
-      this.processingQueue.delete(taskId);
-      this.addToCompleted(taskId, { task, error: "Task aborted" });
-      this.updateState();
-      this.processQueue();
-    }
-  }
-
   private async runTask(task: QueueTask<T>) {
     if (this.destroyed) return;
 
     task.status = TaskStatus.Processing;
     task.attempts = (task.attempts ?? 0) + 1;
+
     let abortController: AbortController;
     try {
       abortController = this.abortManager.createController(task.id);
@@ -417,13 +437,23 @@ export class ConcurrencyQueue<T> {
       if (timeoutId) clearTimeout(timeoutId);
       this.processingQueue.delete(task.id);
       this.abortManager.removeController(task.id);
-      this.addToCompleted(task.id, { task, result });
+
+      this.addToCompleted(task.id, {
+        taskMetadata: {
+          id: task.id,
+          priority: task.priority,
+          addedAt: task.addedAt,
+          status: task.status,
+          attempts: task.attempts,
+        },
+        result,
+      });
       task._resolve && task._resolve(result);
       if (this.onTaskSuccess) this.onTaskSuccess(task, result);
       this.updateState();
     } catch (error: any) {
       if (timeoutId) clearTimeout(timeoutId);
-      let errorMsg = "";
+      let errorMsg: string;
       if (abortController.signal.aborted) {
         errorMsg = "Task aborted or timed out";
         task.status = TaskStatus.Aborted;
@@ -433,11 +463,24 @@ export class ConcurrencyQueue<T> {
       }
       this.processingQueue.delete(task.id);
       this.abortManager.removeController(task.id);
+
       if (typeof task.retries === "number" && task.attempts <= task.retries) {
-        task.status = TaskStatus.Pending;
-        this.enqueueTask(task);
+        // Clear any unneeded references/data before requeuing.
+        this.enqueueTask({
+          ...task,
+          status: TaskStatus.Pending, // Reset status
+        });
       } else {
-        this.addToCompleted(task.id, { task, error: errorMsg });
+        this.addToCompleted(task.id, {
+          taskMetadata: {
+            id: task.id,
+            priority: task.priority,
+            addedAt: task.addedAt,
+            status: task.status,
+            attempts: task.attempts,
+          },
+          error: errorMsg,
+        });
         task._reject && task._reject(new Error(errorMsg));
         if (this.onTaskFailure) this.onTaskFailure(task, errorMsg);
       }
@@ -449,35 +492,140 @@ export class ConcurrencyQueue<T> {
     }
   }
 
-  private addToCompleted(taskId: string, record: CompletedTaskRecord<T>) {
-    this.completedTasks.set(taskId, record);
+  /**
+   * Enqueues a task back to the pending queue (used for retries).
+   */
+  private enqueueTask(task: QueueTask<T>) {
+    // Insert into pending heap
+    this.pendingQueue.push(task);
+    this.updateState();
+  }
+
+  /**
+   * Cancels a task by its ID.
+   *
+   * If the task is pending, it is removed from the queue.
+   * If it is processing, its AbortController is signaled via the AbortManager.
+   */
+  public cancelTask(taskId: string) {
+    if (this.destroyed) return;
+
+    // Attempt to remove the task from the pending queue.
+    const removed = this.pendingQueue.remove((task) => task.id === taskId);
+    if (removed) {
+      this.addToCompleted(taskId, {
+        taskMetadata: {
+          id: taskId,
+          status: TaskStatus.Cancelled,
+        },
+        error: "Task cancelled",
+      });
+      this.updateState();
+      return;
+    }
+
+    // Cancel processing tasks.
+    if (this.processingQueue.has(taskId)) {
+      const task = this.processingQueue.get(taskId)!;
+      try {
+        this.abortManager.abortById(taskId);
+      } catch (err) {
+        console.error(`Error aborting task ${taskId}:`, err);
+      }
+      task.status = TaskStatus.Aborted;
+      task._reject && task._reject(new Error("Task aborted"));
+      this.processingQueue.delete(taskId);
+
+      this.addToCompleted(taskId, {
+        taskMetadata: {
+          id: task.id,
+          priority: task.priority,
+          addedAt: task.addedAt,
+          status: TaskStatus.Cancelled,
+          attempts: task.attempts,
+        },
+        error: "Task aborted",
+      });
+      this.updateState();
+      this.processQueue();
+    }
+  }
+
+  /**
+   * Adds a record to the completed tasks map and performs cleanup
+   * based on maxCompletedTasks and maxCompletedTaskAge.
+   */
+  private addToCompleted(
+    taskId: string,
+    record: Omit<CompletedTaskRecord<T>, "completedAt">
+  ) {
+    const completedAt = new Date();
+    const completedRecord: CompletedTaskRecord<T> = {
+      ...record,
+      completedAt,
+    };
+
+    // If storing completed tasks is disabled (maxCompletedTasks=0), simply return.
+    if (this.maxCompletedTasks === 0) {
+      return;
+    }
+
+    this.completedTasks.set(taskId, completedRecord);
     this.completedTaskOrder.push(taskId);
-    if (this.completedTaskOrder.length > this.maxCompletedTasks) {
-      const removeCount = this.completedTaskOrder.length - this.maxCompletedTasks;
-      for (let i = 0; i < removeCount; i++) {
+
+    // Enforce maxCompletedTasks
+    if (this.maxCompletedTasks >= 0) {
+      while (this.completedTaskOrder.length > this.maxCompletedTasks) {
         const oldTaskId = this.completedTaskOrder.shift();
         if (oldTaskId) {
           this.completedTasks.delete(oldTaskId);
         }
       }
     }
+
+    // Enforce maxCompletedTaskAge
+    if (this.maxCompletedTaskAge !== undefined) {
+      const now = Date.now();
+      const ageThreshold = now - this.maxCompletedTaskAge;
+      while (this.completedTaskOrder.length > 0) {
+        const oldestTaskId = this.completedTaskOrder[0];
+        const oldestRecord = this.completedTasks.get(oldestTaskId);
+        if (
+          oldestRecord &&
+          oldestRecord.completedAt.getTime() < ageThreshold
+        ) {
+          this.completedTaskOrder.shift();
+          this.completedTasks.delete(oldestTaskId);
+        } else {
+          break;
+        }
+      }
+    }
   }
 
+  /**
+   * Returns the current status of a task by ID.
+   */
   public getStatus(taskId: string): TaskStatus | undefined {
     if (this.processingQueue.has(taskId)) {
       return this.processingQueue.get(taskId)!.status;
     }
-    if (this.pendingQueue.toArray().find(task => task.id === taskId)) return TaskStatus.Pending;
+    if (this.pendingQueue.toArray().find((task) => task.id === taskId)) {
+      return TaskStatus.Pending;
+    }
     const completed = this.completedTasks.get(taskId);
-    return completed?.task.status;
+    return completed?.taskMetadata.status;
   }
 
+  /**
+   * Returns a summary of the queue state.
+   */
   public getQueueState() {
     return {
       pending: this.pendingQueue.size(),
       processing: this.processingQueue.size,
       completed: this.completedTasks.size,
-      failed: Array.from(this.completedTasks.values()).filter(item => item.error).length,
+      failed: Array.from(this.completedTasks.values()).filter((item) => item.error).length,
     };
   }
 
@@ -487,12 +635,15 @@ export class ConcurrencyQueue<T> {
    * If a debouncer is set up (because stateUpdateCallback or setCache is provided),
    * this method calls the debounced function. Otherwise, it updates immediately.
    */
-  private updateState() {
+  private updateState(forceImmediate = false) {
     if (this.debouncedUpdateState) {
-      // Schedule the debounced state update.
-      this.debouncedUpdateState.call();
+      if (forceImmediate) {
+        this.debouncedUpdateState.flush();
+      } else {
+        this.debouncedUpdateState.call();
+      }
     } else {
-      // Fallback: update immediately.
+      // Fallback: update immediately
       const state = this.getQueueState();
       if (this.stateUpdateCallback) {
         try {
@@ -515,28 +666,44 @@ export class ConcurrencyQueue<T> {
     }
   }
 
+  /**
+   * Destroys the queue by stopping processing and clearing all internal data.
+   *
+   * This helps prevent memory leaks when the queue is no longer needed.
+   */
   public destroy() {
     this.paused = true;
     this.destroyed = true;
     this.abortManager.abortAll();
-    this.pendingQueue.toArray().forEach(task => {
+
+    // Cancel all pending tasks
+    this.pendingQueue.toArray().forEach((task) => {
       const errorMsg = "Queue destroyed; task cancelled";
       task.status = TaskStatus.Cancelled;
       task._reject && task._reject(new Error(errorMsg));
     });
-    // Clear pending tasks from the heap.
+    // Clear pending tasks from the heap
     while (!this.pendingQueue.isEmpty()) {
       this.pendingQueue.pop();
     }
-    this.processingQueue.forEach(task => {
+
+    // Abort all processing tasks
+    this.processingQueue.forEach((task) => {
       task.abortController?.abort();
       const errorMsg = "Queue destroyed; task aborted";
       task.status = TaskStatus.Aborted;
       task._reject && task._reject(new Error(errorMsg));
     });
     this.processingQueue.clear();
+
+    // Clear completed tasks
     this.completedTasks.clear();
     this.completedTaskOrder = [];
-    this.updateState();
+
+    // Immediately flush any pending state update and cancel debouncer
+    this.updateState(true);
+    if (this.debouncedUpdateState) {
+      this.debouncedUpdateState.cancel();
+    }
   }
 }
